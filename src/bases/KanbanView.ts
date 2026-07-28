@@ -283,6 +283,7 @@ export class KanbanView extends BasesViewBase {
 	private cardLayout: TaskCardOptions["layout"] = "default";
 	private configLoaded = false; // Track if we've successfully loaded config
 	private enable2DLayout = false;
+	private independent2DPositioning = true;
 	private columnPositions: Record<string, { r: number; c: number }> = {};
 	/**
 	 * Threshold for enabling virtual scrolling in kanban columns/swimlane cells.
@@ -424,6 +425,7 @@ export class KanbanView extends BasesViewBase {
 
 			// Read 2D layout options
 			this.enable2DLayout = this.config.get("enable2DLayout") === true;
+			this.independent2DPositioning = this.config.get("independent2DPositioning") !== false;
 			const columnPositionsValue = this.config.get("columnPositions");
 			if (typeof columnPositionsValue === "string" && columnPositionsValue.trim()) {
 				try {
@@ -656,10 +658,15 @@ export class KanbanView extends BasesViewBase {
 			} else {
 				if (this.enable2DLayout) {
 					this.boardEl.addClass("kanban-view__board--2d");
+					this.boardEl.toggleClass(
+						"kanban-view__board--independent",
+						this.independent2DPositioning
+					);
 					this.boardEl.style.setProperty("--kanban-column-width", `${this.columnWidth}px`);
 					this.setupBoard2DDragDrop();
 				} else {
 					this.boardEl.removeClass("kanban-view__board--2d");
+					this.boardEl.removeClass("kanban-view__board--independent");
 				}
 				await this.renderFlat(groups, allGroups);
 			}
@@ -1501,6 +1508,11 @@ export class KanbanView extends BasesViewBase {
 		const orderedKeys = groupByPropertyId
 			? this.applyColumnOrder(groupByPropertyId, columnKeys)
 			: columnKeys;
+
+		if (this.enable2DLayout && this.independent2DPositioning) {
+			await this.renderIndependent2D(groups, orderedKeys, visibleProperties, groupByPropertyId);
+			return;
+		}
 
 		// Build column tree for nested rendering
 		const rootKeys = this.getRootColumnKeys(groups);
@@ -4496,6 +4508,56 @@ export class KanbanView extends BasesViewBase {
 		this.boardEl = null;
 	}
 
+	private async renderIndependent2D(
+		groups: Map<string, TaskInfo[]>,
+		orderedKeys: string[],
+		visibleProperties: string[],
+		groupByPropertyId: string | null
+	): Promise<void> {
+		if (!this.boardEl) return;
+
+		// Group columns by their 'c' (column) coordinate
+		const tracks = new Map<number, string[]>();
+		for (const key of orderedKeys) {
+			const pos = this.columnPositions[key] || { r: 1, c: 1 };
+			if (!tracks.has(pos.c)) tracks.set(pos.c, []);
+			tracks.get(pos.c)!.push(key);
+		}
+
+		const sortedTrackIndices = Array.from(tracks.keys()).sort((a, b) => a - b);
+
+		for (const c of sortedTrackIndices) {
+			const trackKeys = tracks.get(c)!;
+			// Sort keys within track by 'r' (row)
+			trackKeys.sort((a, b) => {
+				const posA = this.columnPositions[a] || { r: 1, c: 1 };
+				const posB = this.columnPositions[b] || { r: 1, c: 1 };
+				return posA.r - posB.r;
+			});
+
+			const trackWrapper = this.boardEl.createDiv({ cls: "kanban-view__2d-column-track" });
+			trackWrapper.style.gridColumn = `${c}`;
+			trackWrapper.setAttribute("data-track-index", `${c}`);
+
+			for (const key of trackKeys) {
+				const tasks = groups.get(key) || [];
+				if (!shouldRenderKanbanColumn(this.hideEmptyColumns, key, tasks, this.pinnedColumns)) {
+					continue;
+				}
+
+				this.sortScopeTaskPaths.set(this.getSortScopeKey(key), tasks.map((t) => t.path));
+
+				const column = await this.createColumn(
+					key,
+					tasks,
+					visibleProperties,
+					groupByPropertyId
+				);
+				trackWrapper.appendChild(column);
+			}
+		}
+	}
+
 	private setupBoard2DDragDrop(): void {
 		if (!this.boardEl) return;
 
@@ -4513,7 +4575,7 @@ export class KanbanView extends BasesViewBase {
 
 		this.boardEl.addEventListener("dragleave", (e: DragEvent) => {
 			if (!this.enable2DLayout || this.swimLanePropertyId) return;
-			if (e.target === this.boardEl) {
+			if (e.target === this.boardEl || (e.target as HTMLElement).classList.contains("kanban-view__2d-column-track")) {
 				this.remove2DPlaceholder();
 			}
 		});
@@ -4548,11 +4610,31 @@ export class KanbanView extends BasesViewBase {
 		const gap = 16; // Default tn-spacing-md
 		const col = Math.floor((clientX - boardRect.left + scrollLeft) / (this.columnWidth + gap)) + 1;
 
-		// Row calculation using actual geometry
+		if (this.independent2DPositioning) {
+			const track = this.boardEl.querySelector(`.kanban-view__2d-column-track[data-track-index="${col}"]`);
+			if (!track) return { r: 1, c: Math.max(1, col) };
+
+			const columns = Array.from(track.querySelectorAll(".kanban-view__column")) as HTMLElement[];
+			if (columns.length === 0) return { r: 1, c: Math.max(1, col) };
+
+			const relativeY = clientY - track.getBoundingClientRect().top;
+
+			for (let i = 0; i < columns.length; i++) {
+				const colEl = columns[i];
+				const box = colEl.getBoundingClientRect();
+				const mid = box.top + box.height / 2 - track.getBoundingClientRect().top;
+				
+				if (relativeY < mid) {
+					return { r: i + 1, c: Math.max(1, col) };
+				}
+			}
+			return { r: columns.length + 1, c: Math.max(1, col) };
+		}
+
+		// Row calculation using actual geometry (Legacy Grid mode)
 		const columns = Array.from(this.boardEl.querySelectorAll(".kanban-view__column")) as HTMLElement[];
 		if (columns.length === 0) return { r: 1, c: Math.max(1, col) };
 
-		// Group columns into visual rows by their offsetTop
 		const rows: { top: number; bottom: number; index: number }[] = [];
 		const rowMap = new Map<number, HTMLElement[]>();
 
@@ -4571,14 +4653,12 @@ export class KanbanView extends BasesViewBase {
 
 		const relativeY = clientY - boardRect.top + scrollTop;
 
-		// Find which row we are in
 		for (const row of rows) {
 			if (relativeY >= row.top - gap / 2 && relativeY <= row.bottom + gap / 2) {
 				return { r: row.index, c: Math.max(1, col) };
 			}
 		}
 
-		// If below all rows
 		if (rows.length > 0 && relativeY > rows[rows.length - 1].bottom) {
 			return { r: rows.length + 1, c: Math.max(1, col) };
 		}
@@ -4589,18 +4669,35 @@ export class KanbanView extends BasesViewBase {
 	private update2DPlaceholder(r: number, c: number): void {
 		if (!this.boardEl) return;
 
-		let placeholder = this.boardEl.querySelector(".kanban-view__placeholder") as HTMLElement;
-		if (!placeholder) {
-			placeholder = this.boardEl.createDiv({ cls: "kanban-view__placeholder" });
-		}
+		this.remove2DPlaceholder();
 
-		placeholder.style.gridRow = `${r}`;
-		placeholder.style.gridColumn = `${c}`;
-		placeholder.style.width = `${this.columnWidth}px`;
+		if (this.independent2DPositioning) {
+			let track = this.boardEl.querySelector(`.kanban-view__2d-column-track[data-track-index="${c}"]`) as HTMLElement;
+			if (!track) {
+				track = this.boardEl.createDiv({ cls: "kanban-view__2d-column-track" });
+				track.style.gridColumn = `${c}`;
+				track.setAttribute("data-track-index", `${c}`);
+			}
+
+			const placeholder = track.createDiv({ cls: "kanban-view__placeholder" });
+			placeholder.style.width = `${this.columnWidth}px`;
+			
+			const columns = Array.from(track.querySelectorAll(".kanban-view__column")) as HTMLElement[];
+			if (r <= columns.length) {
+				track.insertBefore(placeholder, columns[r - 1]);
+			} else {
+				track.appendChild(placeholder);
+			}
+		} else {
+			const placeholder = this.boardEl.createDiv({ cls: "kanban-view__placeholder" });
+			placeholder.style.gridRow = `${r}`;
+			placeholder.style.gridColumn = `${c}`;
+			placeholder.style.width = `${this.columnWidth}px`;
+		}
 	}
 
 	private remove2DPlaceholder(): void {
-		this.boardEl?.querySelector(".kanban-view__placeholder")?.remove();
+		this.boardEl?.querySelectorAll(".kanban-view__placeholder").forEach(el => el.remove());
 	}
 
 	private async handle2DColumnDrop(draggedKey: string, r: number, c: number): Promise<void> {

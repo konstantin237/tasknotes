@@ -128,6 +128,31 @@
     overflow: auto;
 }
 
+.tasknotes-plugin .kanban-view__board--2d.kanban-view__board--independent {
+    grid-auto-rows: unset;
+}
+
+.tasknotes-plugin .kanban-view__2d-column-track {
+    display: flex;
+    flex-direction: column;
+    gap: var(--tn-spacing-md);
+    height: fit-content;
+    min-height: 100%;
+}
+
+.tasknotes-plugin .kanban-view__board--2d .kanban-view__column {
+    height: auto;
+    max-height: 500px;
+}
+
+.tasknotes-plugin .kanban-view__board--2d .kanban-view__placeholder {
+    border: 2px dashed var(--tn-interactive-accent);
+    border-radius: var(--tn-radius-md);
+    background: color-mix(in srgb, var(--tn-interactive-accent) 10%, transparent);
+    min-height: 100px;
+    pointer-events: none;
+}
+
 
 /* Board Scrollbar */
 .tasknotes-plugin .kanban-view__board::-webkit-scrollbar {
