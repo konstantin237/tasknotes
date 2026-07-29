@@ -285,6 +285,21 @@ export class KanbanView extends BasesViewBase {
 	private enable2DLayout = false;
 	private independent2DPositioning = true;
 	private columnPositions: Record<string, { r: number; c: number }> = {};
+	private dragSession2D: {
+		boardRect: DOMRect | null;
+		tracks: Map<number, HTMLElement>;
+		midpoints: Map<number, number[]>;
+		lastPos: { r: number; c: number } | null;
+		placeholder: HTMLElement | null;
+		rafId: number;
+	} = {
+		boardRect: null,
+		tracks: new Map(),
+		midpoints: new Map(),
+		lastPos: null,
+		placeholder: null,
+		rafId: 0,
+	};
 	/**
 	 * Threshold for enabling virtual scrolling in kanban columns/swimlane cells.
 	 * Virtual scrolling activates when a column or cell has >= 15 cards.
@@ -4561,6 +4576,13 @@ export class KanbanView extends BasesViewBase {
 	private setupBoard2DDragDrop(): void {
 		if (!this.boardEl) return;
 
+		this.boardEl.addEventListener("dragstart", (e: DragEvent) => {
+			if (!this.enable2DLayout || this.swimLanePropertyId) return;
+			if (!e.dataTransfer?.types.includes("text/x-kanban-column")) return;
+
+			this.init2DDragSession();
+		});
+
 		this.boardEl.addEventListener("dragover", (e: DragEvent) => {
 			if (!this.enable2DLayout || this.swimLanePropertyId) return;
 			if (!e.dataTransfer?.types.includes("text/x-kanban-column")) return;
@@ -4569,8 +4591,13 @@ export class KanbanView extends BasesViewBase {
 			e.stopPropagation();
 			e.dataTransfer.dropEffect = "move";
 
-			const pos = this.calculateGridPosition(e.clientX, e.clientY);
-			this.update2DPlaceholder(pos.r, pos.c);
+			if (this.dragSession2D.rafId) return;
+
+			this.dragSession2D.rafId = window.requestAnimationFrame(() => {
+				this.dragSession2D.rafId = 0;
+				const pos = this.calculateGridPosition(e.clientX, e.clientY);
+				this.update2DPlaceholder(pos.r, pos.c);
+			});
 		});
 
 		this.boardEl.addEventListener("dragleave", (e: DragEvent) => {
@@ -4588,50 +4615,93 @@ export class KanbanView extends BasesViewBase {
 				e.preventDefault();
 				e.stopPropagation();
 
-				this.remove2DPlaceholder();
-
 				const draggedKey = e.dataTransfer.getData("text/x-kanban-column");
-				if (!draggedKey) return;
-
 				const pos = this.calculateGridPosition(e.clientX, e.clientY);
+
+				this.clear2DDragSession();
+
+				if (!draggedKey) return;
 				await this.handle2DColumnDrop(draggedKey, pos.r, pos.c);
 			})();
 		});
+
+		this.boardEl.addEventListener("dragend", () => {
+			this.clear2DDragSession();
+		});
+	}
+
+	private init2DDragSession(): void {
+		if (!this.boardEl) return;
+
+		this.dragSession2D.boardRect = this.boardEl.getBoundingClientRect();
+		this.dragSession2D.tracks.clear();
+		this.dragSession2D.midpoints.clear();
+		this.dragSession2D.lastPos = null;
+
+		this.boardEl.querySelectorAll(".kanban-view__2d-column-track").forEach((el) => {
+			const track = el as HTMLElement;
+			const index = parseInt(track.dataset.trackIndex || "0");
+			if (index > 0) {
+				this.dragSession2D.tracks.set(index, track);
+			}
+		});
+
+		const doc = this.boardEl.ownerDocument;
+		this.dragSession2D.placeholder = doc.createElement("div");
+		this.dragSession2D.placeholder.className = "kanban-view__placeholder";
+		this.dragSession2D.placeholder.style.width = `${this.columnWidth}px`;
+	}
+
+	private clear2DDragSession(): void {
+		if (this.dragSession2D.rafId) {
+			window.cancelAnimationFrame(this.dragSession2D.rafId);
+			this.dragSession2D.rafId = 0;
+		}
+		this.remove2DPlaceholder();
+		this.dragSession2D.boardRect = null;
+		this.dragSession2D.tracks.clear();
+		this.dragSession2D.midpoints.clear();
+		this.dragSession2D.lastPos = null;
+		this.dragSession2D.placeholder = null;
 	}
 
 	private calculateGridPosition(clientX: number, clientY: number): { r: number; c: number } {
 		if (!this.boardEl) return { r: 1, c: 1 };
 
-		const boardRect = this.boardEl.getBoundingClientRect();
+		const boardRect = this.dragSession2D.boardRect || this.boardEl.getBoundingClientRect();
 		const scrollLeft = this.boardEl.scrollLeft;
 		const scrollTop = this.boardEl.scrollTop;
 
-		// Column calculation
-		const gap = 16; // Default tn-spacing-md
+		const gap = 16;
 		const col = Math.floor((clientX - boardRect.left + scrollLeft) / (this.columnWidth + gap)) + 1;
 
 		if (this.independent2DPositioning) {
-			const track = this.boardEl.querySelector(`.kanban-view__2d-column-track[data-track-index="${col}"]`);
+			const track = this.dragSession2D.tracks.get(col) || this.boardEl.querySelector(`.kanban-view__2d-column-track[data-track-index="${col}"]`);
 			if (!track) return { r: 1, c: Math.max(1, col) };
 
-			const columns = Array.from(track.querySelectorAll(".kanban-view__column")) as HTMLElement[];
-			if (columns.length === 0) return { r: 1, c: Math.max(1, col) };
+			const trackEl = track as HTMLElement;
+			const trackRect = trackEl.getBoundingClientRect();
+			const relativeY = clientY - trackRect.top;
 
-			const relativeY = clientY - track.getBoundingClientRect().top;
+			let midpoints = this.dragSession2D.midpoints.get(col);
+			if (!midpoints) {
+				const columns = Array.from(trackEl.querySelectorAll(".kanban-view__column")) as HTMLElement[];
+				midpoints = columns.map(colEl => {
+					const box = colEl.getBoundingClientRect();
+					return box.top + box.height / 2 - trackRect.top;
+				});
+				this.dragSession2D.midpoints.set(col, midpoints);
+			}
 
-			for (let i = 0; i < columns.length; i++) {
-				const colEl = columns[i];
-				const box = colEl.getBoundingClientRect();
-				const mid = box.top + box.height / 2 - track.getBoundingClientRect().top;
-				
-				if (relativeY < mid) {
+			for (let i = 0; i < midpoints.length; i++) {
+				if (relativeY < midpoints[i]) {
 					return { r: i + 1, c: Math.max(1, col) };
 				}
 			}
-			return { r: columns.length + 1, c: Math.max(1, col) };
+			return { r: midpoints.length + 1, c: Math.max(1, col) };
 		}
 
-		// Row calculation using actual geometry (Legacy Grid mode)
+		// Legacy Grid mode
 		const columns = Array.from(this.boardEl.querySelectorAll(".kanban-view__column")) as HTMLElement[];
 		if (columns.length === 0) return { r: 1, c: Math.max(1, col) };
 
@@ -4667,21 +4737,26 @@ export class KanbanView extends BasesViewBase {
 	}
 
 	private update2DPlaceholder(r: number, c: number): void {
-		if (!this.boardEl) return;
+		if (!this.boardEl || !this.dragSession2D.placeholder) return;
 
-		this.remove2DPlaceholder();
+		const last = this.dragSession2D.lastPos;
+		if (last && last.r === r && last.c === c) return;
+		this.dragSession2D.lastPos = { r, c };
+
+		const placeholder = this.dragSession2D.placeholder;
 
 		if (this.independent2DPositioning) {
-			let track = this.boardEl.querySelector(`.kanban-view__2d-column-track[data-track-index="${c}"]`) as HTMLElement;
+			let track = this.dragSession2D.tracks.get(c);
 			if (!track) {
-				track = this.boardEl.createDiv({ cls: "kanban-view__2d-column-track" });
-				track.style.gridColumn = `${c}`;
-				track.setAttribute("data-track-index", `${c}`);
+				track = this.boardEl.querySelector(`.kanban-view__2d-column-track[data-track-index="${c}"]`) as HTMLElement;
+				if (!track) {
+					track = this.boardEl.createDiv({ cls: "kanban-view__2d-column-track" });
+					track.style.gridColumn = `${c}`;
+					track.setAttribute("data-track-index", `${c}`);
+					this.dragSession2D.tracks.set(c, track);
+				}
 			}
 
-			const placeholder = track.createDiv({ cls: "kanban-view__placeholder" });
-			placeholder.style.width = `${this.columnWidth}px`;
-			
 			const columns = Array.from(track.querySelectorAll(".kanban-view__column")) as HTMLElement[];
 			if (r <= columns.length) {
 				track.insertBefore(placeholder, columns[r - 1]);
@@ -4689,15 +4764,17 @@ export class KanbanView extends BasesViewBase {
 				track.appendChild(placeholder);
 			}
 		} else {
-			const placeholder = this.boardEl.createDiv({ cls: "kanban-view__placeholder" });
 			placeholder.style.gridRow = `${r}`;
 			placeholder.style.gridColumn = `${c}`;
-			placeholder.style.width = `${this.columnWidth}px`;
+			if (placeholder.parentElement !== this.boardEl) {
+				this.boardEl.appendChild(placeholder);
+			}
 		}
 	}
 
 	private remove2DPlaceholder(): void {
-		this.boardEl?.querySelectorAll(".kanban-view__placeholder").forEach(el => el.remove());
+		this.dragSession2D.placeholder?.remove();
+		this.dragSession2D.lastPos = null;
 	}
 
 	private async handle2DColumnDrop(draggedKey: string, r: number, c: number): Promise<void> {
