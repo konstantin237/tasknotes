@@ -288,6 +288,8 @@ export class KanbanView extends BasesViewBase {
 	private dragSession2D: {
 		boardRect: DOMRect | null;
 		tracks: Map<number, HTMLElement>;
+		trackRects: Map<number, DOMRect>;
+		trackColumns: Map<number, HTMLElement[]>;
 		midpoints: Map<number, number[]>;
 		lastPos: { r: number; c: number } | null;
 		placeholder: HTMLElement | null;
@@ -295,6 +297,8 @@ export class KanbanView extends BasesViewBase {
 	} = {
 		boardRect: null,
 		tracks: new Map(),
+		trackRects: new Map(),
+		trackColumns: new Map(),
 		midpoints: new Map(),
 		lastPos: null,
 		placeholder: null,
@@ -4635,6 +4639,8 @@ export class KanbanView extends BasesViewBase {
 
 		this.dragSession2D.boardRect = this.boardEl.getBoundingClientRect();
 		this.dragSession2D.tracks.clear();
+		this.dragSession2D.trackRects.clear();
+		this.dragSession2D.trackColumns.clear();
 		this.dragSession2D.midpoints.clear();
 		this.dragSession2D.lastPos = null;
 
@@ -4643,6 +4649,17 @@ export class KanbanView extends BasesViewBase {
 			const index = parseInt(track.dataset.trackIndex || "0");
 			if (index > 0) {
 				this.dragSession2D.tracks.set(index, track);
+				this.dragSession2D.trackRects.set(index, track.getBoundingClientRect());
+				
+				const columns = Array.from(track.querySelectorAll(".kanban-view__column")) as HTMLElement[];
+				this.dragSession2D.trackColumns.set(index, columns);
+				
+				const trackTop = this.dragSession2D.trackRects.get(index)!.top;
+				const midpoints = columns.map(colEl => {
+					const box = colEl.getBoundingClientRect();
+					return box.top + box.height / 2 - trackTop;
+				});
+				this.dragSession2D.midpoints.set(index, midpoints);
 			}
 		});
 
@@ -4660,6 +4677,8 @@ export class KanbanView extends BasesViewBase {
 		this.remove2DPlaceholder();
 		this.dragSession2D.boardRect = null;
 		this.dragSession2D.tracks.clear();
+		this.dragSession2D.trackRects.clear();
+		this.dragSession2D.trackColumns.clear();
 		this.dragSession2D.midpoints.clear();
 		this.dragSession2D.lastPos = null;
 		this.dragSession2D.placeholder = null;
@@ -4670,28 +4689,17 @@ export class KanbanView extends BasesViewBase {
 
 		const boardRect = this.dragSession2D.boardRect || this.boardEl.getBoundingClientRect();
 		const scrollLeft = this.boardEl.scrollLeft;
-		const scrollTop = this.boardEl.scrollTop;
 
 		const gap = 16;
 		const col = Math.floor((clientX - boardRect.left + scrollLeft) / (this.columnWidth + gap)) + 1;
 
 		if (this.independent2DPositioning) {
-			const track = this.dragSession2D.tracks.get(col) || this.boardEl.querySelector(`.kanban-view__2d-column-track[data-track-index="${col}"]`);
-			if (!track) return { r: 1, c: Math.max(1, col) };
+			const trackRect = this.dragSession2D.trackRects.get(col);
+			const midpoints = this.dragSession2D.midpoints.get(col);
+			
+			if (!trackRect || !midpoints) return { r: 1, c: Math.max(1, col) };
 
-			const trackEl = track as HTMLElement;
-			const trackRect = trackEl.getBoundingClientRect();
 			const relativeY = clientY - trackRect.top;
-
-			let midpoints = this.dragSession2D.midpoints.get(col);
-			if (!midpoints) {
-				const columns = Array.from(trackEl.querySelectorAll(".kanban-view__column")) as HTMLElement[];
-				midpoints = columns.map(colEl => {
-					const box = colEl.getBoundingClientRect();
-					return box.top + box.height / 2 - trackRect.top;
-				});
-				this.dragSession2D.midpoints.set(col, midpoints);
-			}
 
 			for (let i = 0; i < midpoints.length; i++) {
 				if (relativeY < midpoints[i]) {
@@ -4721,7 +4729,7 @@ export class KanbanView extends BasesViewBase {
 			rows.push({ top, bottom: maxBottom, index: index + 1 });
 		});
 
-		const relativeY = clientY - boardRect.top + scrollTop;
+		const relativeY = clientY - boardRect.top + this.boardEl.scrollTop;
 
 		for (const row of rows) {
 			if (relativeY >= row.top - gap / 2 && relativeY <= row.bottom + gap / 2) {
@@ -4748,16 +4756,16 @@ export class KanbanView extends BasesViewBase {
 		if (this.independent2DPositioning) {
 			let track = this.dragSession2D.tracks.get(c);
 			if (!track) {
-				track = this.boardEl.querySelector(`.kanban-view__2d-column-track[data-track-index="${c}"]`) as HTMLElement;
-				if (!track) {
-					track = this.boardEl.createDiv({ cls: "kanban-view__2d-column-track" });
-					track.style.gridColumn = `${c}`;
-					track.setAttribute("data-track-index", `${c}`);
-					this.dragSession2D.tracks.set(c, track);
-				}
+				track = this.boardEl.createDiv({ cls: "kanban-view__2d-column-track" });
+				track.style.gridColumn = `${c}`;
+				track.setAttribute("data-track-index", `${c}`);
+				this.dragSession2D.tracks.set(c, track);
+				this.dragSession2D.trackRects.set(c, track.getBoundingClientRect());
+				this.dragSession2D.trackColumns.set(c, []);
+				this.dragSession2D.midpoints.set(c, []);
 			}
 
-			const columns = Array.from(track.querySelectorAll(".kanban-view__column")) as HTMLElement[];
+			const columns = this.dragSession2D.trackColumns.get(c) || [];
 			if (r <= columns.length) {
 				track.insertBefore(placeholder, columns[r - 1]);
 			} else {
@@ -4779,6 +4787,7 @@ export class KanbanView extends BasesViewBase {
 
 	private async handle2DColumnDrop(draggedKey: string, r: number, c: number): Promise<void> {
 		const newPositions = { ...this.columnPositions };
+		const affectedKeys: string[] = [draggedKey];
 
 		// Push-down collision resolution
 		const resolve = (row: number, col: number, keyToIgnore: string) => {
@@ -4789,6 +4798,7 @@ export class KanbanView extends BasesViewBase {
 			if (occupiedKey) {
 				resolve(row + 1, col, occupiedKey);
 				newPositions[occupiedKey] = { r: row + 1, c: col };
+				affectedKeys.push(occupiedKey);
 			}
 		};
 
@@ -4797,7 +4807,62 @@ export class KanbanView extends BasesViewBase {
 
 		this.columnPositions = newPositions;
 		await this.saveColumnPositions();
-		await this.render();
+
+		if (this.independent2DPositioning) {
+			// Incremental DOM update for independent mode
+			for (const key of affectedKeys) {
+				this.syncColumnElementDOM(key);
+			}
+			this.cleanupEmptyTracks();
+		} else {
+			// Fallback to full render for legacy grid mode
+			await this.render();
+		}
+	}
+
+	private syncColumnElementDOM(groupKey: string): void {
+		if (!this.boardEl) return;
+		const pos = this.columnPositions[groupKey];
+		if (!pos) return;
+
+		const columnEl = this.boardEl.querySelector(`.kanban-view__column[data-group="${groupKey}"]`) as HTMLElement;
+		if (!columnEl) return;
+
+		let track = this.boardEl.querySelector(`.kanban-view__2d-column-track[data-track-index="${pos.c}"]`) as HTMLElement;
+		if (!track) {
+			track = this.boardEl.createDiv({ cls: "kanban-view__2d-column-track" });
+			track.style.gridColumn = `${pos.c}`;
+			track.setAttribute("data-track-index", `${pos.c}`);
+		}
+
+		// Find correct insertion point within track
+		const siblings = Array.from(track.querySelectorAll(`.kanban-view__column:not([data-group="${groupKey}"])`)) as HTMLElement[];
+		let inserted = false;
+
+		for (const sibling of siblings) {
+			const siblingKey = sibling.dataset.group;
+			if (siblingKey) {
+				const siblingPos = this.columnPositions[siblingKey];
+				if (siblingPos && siblingPos.r > pos.r) {
+					track.insertBefore(columnEl, sibling);
+					inserted = true;
+					break;
+				}
+			}
+		}
+
+		if (!inserted) {
+			track.appendChild(columnEl);
+		}
+	}
+
+	private cleanupEmptyTracks(): void {
+		if (!this.boardEl) return;
+		this.boardEl.querySelectorAll(".kanban-view__2d-column-track").forEach((track) => {
+			if (track.querySelectorAll(".kanban-view__column").length === 0) {
+				track.remove();
+			}
+		});
 	}
 
 	private async saveColumnPositions(): Promise<void> {
